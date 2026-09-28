@@ -1,0 +1,19 @@
+# 构建产物（exe 通过 GitHub Release 发布，不入仓库）
+build/
+dist/
+__pycache__/
+*.spec
+
+# 诊断/临时文件
+dump_*
+_diag_tool.py
+_*.py
+
+# Python
+*.pyc
+*.pyo
+.venv/
+
+# 编辑器
+.vscode/
+.idea/
