@@ -39,3 +39,8 @@ pyinstaller --onefile --windowed --name QzonePhotoDownloader --collect-all curl_
 ## 免责声明
 
 本工具由trae生成，仅供个人备份自己 QQ 空间内容使用，请遵守 QQ 空间服务条款与相关法律法规，勿用于侵犯他人隐私或其他违规用途。
+
+
+## github 仓库
+
+https://github.com/qx5000/qzone-photo-downloader

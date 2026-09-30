@@ -252,53 +252,123 @@ class QzoneClient:
 
     # ---------- 相册列表 ----------
 
-    def get_albums(self):
-        """返回 [{id(UUID), name, count}]，参数与浏览器请求完全一致"""
+    def get_albums(self, log=print):
+        """返回 [{id(UUID), name, count}]
+
+        翻页策略（QQ 相册接口会截量，每页最多约 30 条）：
+        - pageNumModeSort/pageNum 设大值，同时发送多种翻页参数名
+          （pageStart/start/begin/offset），兼容不同版本接口
+        - 不再以"返回数 < 请求数"判末页（API 截量导致永远成立），
+          改为一直翻页直到：本页无新增(去重命中) / 返回空 / 达到总数
+        - albumListModeSort 与 albumListModeClass（含分类嵌套）合并去重
+        - 安全上限 100 页
+        """
         if not self.uin:
             raise RuntimeError("未获取到QQ号")
         if not self.p_skey:
             raise RuntimeError("未获取到登录凭证(p_skey)，请重新扫码登录")
 
-        params = self._base_params()
-        params.update({
-            "t": str(random.randint(100000000, 999999999)),
-            "format": "jsonp",
-            "notice": "0",
-            "filter": "1",
-            "handset": "4",
-            "pageNumModeSort": "40",
-            "pageNumModeClass": "15",
-            "needUserInfo": "1",
-            "idcNum": "4",
-            "callbackFun": "shine0",
-        })
-
-        resp = self.session.get(self.ALBUM_API, params=params,
-                                headers=self._headers(), timeout=20)
-        if resp.status_code != 200:
-            raise RuntimeError(f"相册接口 HTTP {resp.status_code}")
-
-        data = parse_jsonp(resp.text)
-        if not data or data.get("code") != 0:
-            raise RuntimeError(f"相册接口返回异常：{resp.text[:200]}")
-
-        d = data.get("data", {})
-        # 真实返回：按时间排序 albumListModeSort；按分类 albumListModeClass
-        raw_list = list(d.get("albumListModeSort") or [])
-        for it in (d.get("albumListModeClass") or []):
-            if not any(str(x.get("id")) == str(it.get("id")) for x in raw_list):
-                raw_list.append(it)
-
+        page_size = 1000          # 请求数量（API 会自行截量）
+        max_pages = 100           # 安全上限
+        seen_ids = set()
         albums = []
-        for item in raw_list:
-            aid = str(item.get("id") or item.get("albumId") or "")
-            if not aid:
-                continue
-            albums.append({
-                "id": aid,
-                "name": item.get("name") or item.get("albumName") or "未命名相册",
-                "count": item.get("total") or item.get("photoNum") or 0,
+
+        for page in range(max_pages):
+            offset = len(albums)
+            params = self._base_params()
+            params.update({
+                "t": str(random.randint(100000000, 999999999)),
+                "format": "jsonp",
+                "notice": "0",
+                "filter": "1",
+                "handset": "4",
+                # 翻页偏移：多种参数名兼容不同接口版本
+                "pageStart": str(offset),
+                "start": str(offset),
+                "begin": str(offset),
+                "offset": str(offset),
+                # 单页数量：多种参数名兼容
+                "pageNumModeSort": str(page_size),
+                "pageNum": str(page_size),
+                "pageNumModeClass": "500",
+                "needUserInfo": "1",
+                "idcNum": "4",
+                "callbackFun": "shine0",
             })
+
+            resp = self.session.get(self.ALBUM_API, params=params,
+                                    headers=self._headers(), timeout=20)
+            if resp.status_code != 200:
+                if page == 0:
+                    raise RuntimeError(f"相册接口 HTTP {resp.status_code}")
+                break
+
+            data = parse_jsonp(resp.text)
+            if not data or data.get("code") != 0:
+                if page == 0:
+                    raise RuntimeError(f"相册接口返回异常：{resp.text[:200]}")
+                break
+
+            d = data.get("data", {})
+            sort_list = list(d.get("albumListModeSort") or [])
+
+            # albumListModeClass 可能是相册列表，也可能是分类列表（每项含 albumList）
+            class_list = list(d.get("albumListModeClass") or [])
+            class_albums = []
+            for it in class_list:
+                sub = (it.get("albumList") or it.get("list")
+                       or it.get("photos") or it.get("albums"))
+                if isinstance(sub, list):
+                    class_albums.extend(sub)
+                else:
+                    class_albums.append(it)
+
+            # 合并 sort + class，按 id 去重
+            batch = sort_list[:]
+            for it in class_albums:
+                if not any(str(x.get("id")) == str(it.get("id"))
+                           for x in batch):
+                    batch.append(it)
+
+            before = len(albums)
+            for item in batch:
+                aid = str(item.get("id") or item.get("albumId") or "")
+                if not aid or aid in seen_ids:
+                    continue
+                seen_ids.add(aid)
+                albums.append({
+                    "id": aid,
+                    "name": item.get("name") or item.get("albumName") or "未命名相册",
+                    "count": item.get("total") or item.get("photoNum") or 0,
+                })
+
+            new_count = len(albums) - before
+            log(f"  相册第{page + 1}页：返回 {len(sort_list)} 项，"
+                f"新增 {new_count}，累计 {len(albums)}")
+
+            # 读取总数（兼容多种字段名）
+            total = 0
+            for key in ("totalSort", "total", "albumCount",
+                        "totalNum", "totalAlbum", "totalInAlbum"):
+                v = d.get(key)
+                if v:
+                    try:
+                        total = int(v)
+                        break
+                    except (TypeError, ValueError):
+                        pass
+
+            # 终止条件（不再用"返回数 < 请求数"判断，因为 API 会截量）：
+            # 1. 有总数且已取满
+            # 2. sort 返回为空（没有更多数据）
+            # 3. 本页无新增（翻页参数未生效 / 已是最后一页）
+            if total and len(albums) >= total:
+                break
+            if len(sort_list) == 0:
+                break
+            if new_count == 0:
+                break
+
         return albums
 
     # ---------- 媒体列表（图片+视频） ----------
@@ -619,11 +689,15 @@ class App:
         self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
     def load_albums(self):
-        ttk.Label(self.album_list_frame, text="正在加载相册列表...").pack(pady=20)
+        status_label = ttk.Label(self.album_list_frame, text="正在加载相册列表...")
+        status_label.pack(pady=20)
+
+        def log(msg):
+            self.root.after(0, status_label.config, {"text": msg})
 
         def task():
             try:
-                albums = self.client.get_albums()
+                albums = self.client.get_albums(log=log)
                 self.root.after(0, self._display_albums, albums)
             except Exception as e:
                 self.root.after(0, self._albums_error, str(e))
